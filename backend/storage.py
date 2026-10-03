@@ -20,9 +20,11 @@ crash mid-write can never leave a half-written JSON file, and concurrent
 requests (Flask runs threaded by default) serialise correctly.
 
 The "audio files + JSON metadata stay in sync" problem is handled centrally:
-deleting a file also removes its analyses and version snapshots under the same
-lock, and every mutation goes through :class:`Storage` so the registry and the
-on-disk artefacts cannot drift apart.
+deleting a file cascades to every derived descendant (edits, separations,
+mixes, exports — tracked through ``derived_from`` / ``source_ids``), removes
+analyses and version snapshots under the same lock, and strips dangling track
+references from every mix project.  Every mutation goes through
+:class:`Storage` so the registry and the on-disk artefacts cannot drift apart.
 """
 
 from __future__ import annotations
@@ -203,34 +205,123 @@ class Storage:
         self._update_library(_patch)
         return self.get_file(file_id)
 
-    def delete_file(self, file_id: str) -> bool:
-        """Delete an audio file and every derived artefact, keeping the index in sync."""
-        def _delete(lib: Dict[str, Any]) -> None:
-            entry = lib.get("files", {}).pop(file_id, None)
-            if entry is None:
-                return
-            # Remove the audio blob.
-            audio_path = os.path.join(self.root, entry.get("path", ""))
-            if os.path.isfile(audio_path):
-                os.unlink(audio_path)
-            # Remove analyses (best-effort glob).
-            for kind in entry.get("analyses", []):
-                ap = self._analysis_path(file_id, kind)
-                if os.path.isfile(ap):
-                    os.unlink(ap)
-            # Remove version snapshots for this file.
-            for vp in self._version_glob(file_id):
-                if os.path.isfile(vp):
-                    os.unlink(vp)
+    # -- derivation graph ------------------------------------------------- #
 
-        before = self.get_file(file_id)
-        if before is None:
-            return False
+    @staticmethod
+    def _parent_ids(entry: Dict[str, Any]) -> List[str]:
+        """All file ids ``entry`` derives from (single parent or mix sources)."""
+        parents = []
+        derived_from = entry.get("derived_from")
+        if derived_from:
+            parents.append(derived_from)
+        parents.extend(entry.get("source_ids") or [])
+        return parents
+
+    def _descendants(self, files: Dict[str, Any], root_id: str) -> set:
+        """Transitive closure of everything derived from ``root_id`` (inclusive)."""
+        doomed = {root_id}
+        frontier = [root_id]
+        while frontier:
+            current = frontier.pop()
+            for fid, entry in files.items():
+                if fid not in doomed and current in self._parent_ids(entry):
+                    doomed.add(fid)
+                    frontier.append(fid)
+        return doomed
+
+    def dependents(self, file_id: str) -> Optional[Dict[str, Any]]:
+        """Preview of what deleting ``file_id`` would cascade to.
+
+        Returns ``{"file": ..., "derived": [...], "projects": [...]}`` or
+        ``None`` when the file does not exist.
+        """
+        lib = self._read_library()
+        files = lib.get("files", {})
+        entry = files.get(file_id)
+        if entry is None:
+            return None
+        doomed = self._descendants(files, file_id)
+        derived = [files[fid] for fid in files if fid in doomed and fid != file_id]
+        return {"file": entry, "derived": derived,
+                "projects": self._projects_referencing(doomed)}
+
+    def _projects_referencing(self, file_ids: set) -> List[Dict[str, Any]]:
+        """Summary of projects whose tracks reference any id in ``file_ids``."""
+        affected = []
+        for project in self.list_projects():
+            n = sum(1 for t in project.get("tracks", [])
+                    if t.get("file_id") in file_ids)
+            if n:
+                affected.append({"id": project.get("id"),
+                                 "name": project.get("name"),
+                                 "affected_tracks": n})
+        return affected
+
+    def delete_file(self, file_id: str) -> Optional[Dict[str, Any]]:
+        """Delete a file, its whole derivation subtree and project references.
+
+        Returns ``{"deleted": [...], "projects": [...]}`` — the removed entries
+        and the projects whose tracks were cleaned up — or ``None`` when the
+        file does not exist.
+        """
         with locked(self.library_path + ".lock"):
             lib = self._read_library()
-            _delete(lib)
+            files = lib.get("files", {})
+            if file_id not in files:
+                return None
+            doomed = self._descendants(files, file_id)
+            deleted = []
+            for fid in sorted(doomed):
+                entry = files.pop(fid, None)
+                if entry is None:
+                    continue
+                deleted.append(entry)
+                self._purge_artefacts(fid, entry)
             atomic_write(self.library_path, lib)
-        return True
+        # Project docs have their own locks — update them after releasing the
+        # library lock to keep lock ordering flat.
+        projects = self._purge_project_references(doomed)
+        return {"deleted": deleted, "projects": projects}
+
+    def _purge_artefacts(self, file_id: str, entry: Dict[str, Any]) -> None:
+        """Remove the on-disk artefacts belonging to a registry entry."""
+        audio_path = os.path.join(self.root, entry.get("path", ""))
+        if os.path.isfile(audio_path):
+            os.unlink(audio_path)
+        # Remove analyses (best-effort glob).
+        for kind in entry.get("analyses", []):
+            ap = self._analysis_path(file_id, kind)
+            if os.path.isfile(ap):
+                os.unlink(ap)
+        # Remove version snapshots for this file.
+        for vp in self._version_glob(file_id):
+            if os.path.isfile(vp):
+                os.unlink(vp)
+
+    def _purge_project_references(self, file_ids: set) -> List[Dict[str, Any]]:
+        """Drop tracks pointing at deleted files from every project."""
+        affected = []
+        for name in sorted(os.listdir(self.projects_dir)):
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(self.projects_dir, name)
+            with locked(path + ".lock"):
+                project = read_json(path, None)
+                if not project:
+                    continue
+                tracks = project.get("tracks", [])
+                kept = [t for t in tracks if t.get("file_id") not in file_ids]
+                if len(kept) == len(tracks):
+                    continue
+                project["tracks"] = kept
+                project["version"] = int(project.get("version", 0)) + 1
+                project["updated_at"] = now_iso()
+                atomic_write(path, project)
+            self._snapshot_project(project)
+            affected.append({"id": project.get("id"),
+                             "name": project.get("name"),
+                             "removed_tracks": len(tracks) - len(kept)})
+        return affected
 
     # -- analysis results ------------------------------------------------- #
 

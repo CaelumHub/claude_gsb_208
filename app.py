@@ -134,11 +134,24 @@ def api_update_file(file_id: str):
     return jsonify(entry)
 
 
+@app.get("/api/library/<file_id>/dependents")
+def api_dependents(file_id: str):
+    """Preview of the cascade: derived files and projects affected by deletion."""
+    info = store.dependents(file_id)
+    if info is None:
+        return jsonify(error="file not found"), 404
+    return jsonify(info)
+
+
 @app.delete("/api/library/<file_id>")
 def api_delete_file(file_id: str):
-    if not store.delete_file(file_id):
+    result = store.delete_file(file_id)
+    if result is None:
         return jsonify(error="file not found"), 404
-    return jsonify(ok=True)
+    return jsonify(ok=True,
+                   deleted=[{"id": e["id"], "name": e.get("name")}
+                            for e in result["deleted"]],
+                   projects=result["projects"])
 
 
 @app.post("/api/library/upload")
@@ -572,17 +585,23 @@ def api_mix_project(project_id: str):
         return jsonify(error="project not found"), 404
     data = request.get_json(force=True) or {}
     tracks = []
+    source_ids = []
     for t in p.get("tracks", []):
         e = _entry(t.get("file_id"))
         if e:
             tracks.append({"path": _abs_path(e), "gain": t.get("gain", 1.0),
                            "pan": t.get("pan", 0.0), "muted": t.get("muted", False)})
+            source_ids.append(e["id"])
     file_id_new = storage.new_id()
     dst = os.path.join(store.audio_dir, file_id_new + ".wav")
     master = p.get("master", {})
     result = mixer.mixdown(tracks, dst, master_gain=master.get("gain", 1.0))
     name = data.get("name") or f"mixdown-{p['name']}.wav"
-    entry = _register_derived(None, name, dst, {"project_id": project_id, **result})
+    entry = _register_derived(None, name, dst, {
+        "project_id": project_id,
+        "source_ids": source_ids,
+        **result,
+    })
     return jsonify(entry)
 
 

@@ -51,7 +51,7 @@ async function loadLibrary() { library = await API.get("/api/library"); }
 
 function fileName(id) {
   const f = library.find(x => x.id === id);
-  return f ? f.name : id;
+  return f ? f.name : "（文件已删除）";
 }
 
 async function loadProjects(selected) {
