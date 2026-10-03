@@ -130,9 +130,21 @@ async function load() {
 }
 
 async function del(id) {
-  if (!confirm("确定删除该文件及其分析结果？")) return;
-  await API.del("/api/library/" + id);
-  toast("已删除", "success");
+  let info;
+  try { info = await API.get(`/api/library/${id}/dependents`); }
+  catch (e) { return toast(e.message, "error"); }
+  const parts = ["确定删除该文件及其分析结果？"];
+  if (info.derived.length)
+    parts.push(`将级联删除 ${info.derived.length} 个派生文件：\n` +
+      info.derived.map(f => "· " + f.name).join("\n"));
+  if (info.projects.length)
+    parts.push(`将从以下混音项目中移除引用它的轨道：\n` +
+      info.projects.map(p => `· ${p.name}（${p.tracks} 轨）`).join("\n"));
+  if (!confirm(parts.join("\n\n"))) return;
+  const res = await API.del("/api/library/" + id);
+  const n = (res.deleted || []).length;
+  const m = (res.projects || []).length;
+  toast(`已删除 ${n} 个文件` + (m ? `，并清理了 ${m} 个项目中的引用轨道` : ""), "success");
   load();
 }
 

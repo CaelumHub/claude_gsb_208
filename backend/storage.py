@@ -20,9 +20,12 @@ crash mid-write can never leave a half-written JSON file, and concurrent
 requests (Flask runs threaded by default) serialise correctly.
 
 The "audio files + JSON metadata stay in sync" problem is handled centrally:
-deleting a file also removes its analyses and version snapshots under the same
-lock, and every mutation goes through :class:`Storage` so the registry and the
-on-disk artefacts cannot drift apart.
+deleting a file cascades through its whole ``derived_from`` subtree (edits,
+separations, renders, exports), removes analyses and version snapshots under
+the same lock, and strips dangling track references from every project, so
+neither orphan files nor broken projects can be left behind.  Every mutation
+goes through :class:`Storage` so the registry and the on-disk artefacts
+cannot drift apart.
 """
 
 from __future__ import annotations
@@ -203,34 +206,112 @@ class Storage:
         self._update_library(_patch)
         return self.get_file(file_id)
 
-    def delete_file(self, file_id: str) -> bool:
-        """Delete an audio file and every derived artefact, keeping the index in sync."""
-        def _delete(lib: Dict[str, Any]) -> None:
-            entry = lib.get("files", {}).pop(file_id, None)
-            if entry is None:
-                return
-            # Remove the audio blob.
-            audio_path = os.path.join(self.root, entry.get("path", ""))
-            if os.path.isfile(audio_path):
-                os.unlink(audio_path)
-            # Remove analyses (best-effort glob).
-            for kind in entry.get("analyses", []):
-                ap = self._analysis_path(file_id, kind)
-                if os.path.isfile(ap):
-                    os.unlink(ap)
-            # Remove version snapshots for this file.
-            for vp in self._version_glob(file_id):
-                if os.path.isfile(vp):
-                    os.unlink(vp)
+    @staticmethod
+    def _descendants(files: Dict[str, Any], root_id: str) -> List[str]:
+        """Return ``root_id`` plus every transitive ``derived_from`` descendant."""
+        order: List[str] = []
+        stack = [root_id]
+        seen = set()
+        while stack:
+            fid = stack.pop()
+            if fid in seen or fid not in files:
+                continue
+            seen.add(fid)
+            order.append(fid)
+            stack.extend(other for other, e in files.items()
+                         if e.get("derived_from") == fid and other not in seen)
+        return order
 
-        before = self.get_file(file_id)
-        if before is None:
-            return False
+    def _remove_file_artefacts(self, file_id: str, entry: Dict[str, Any]) -> None:
+        """Unlink the on-disk artefacts of a registry entry (blob, analyses, versions)."""
+        audio_path = os.path.join(self.root, entry.get("path", ""))
+        if os.path.isfile(audio_path):
+            os.unlink(audio_path)
+        for kind in entry.get("analyses", []):
+            ap = self._analysis_path(file_id, kind)
+            if os.path.isfile(ap):
+                os.unlink(ap)
+        for vp in self._version_glob(file_id):
+            if os.path.isfile(vp):
+                os.unlink(vp)
+
+    def _purge_from_projects(self, deleted_ids: set) -> List[Dict[str, Any]]:
+        """Drop tracks that reference deleted files from every project.
+
+        Each affected project gets a version bump (and therefore a history
+        snapshot) so the reference cleanup is itself recorded and revertable.
+        """
+        updated = []
+        for name in sorted(os.listdir(self.projects_dir)):
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(self.projects_dir, name)
+            with locked(path + ".lock"):
+                project = read_json(path, None)
+                if not project:
+                    continue
+                tracks = project.get("tracks", [])
+                removed = [t for t in tracks if t.get("file_id") in deleted_ids]
+                if not removed:
+                    continue
+                project["tracks"] = [t for t in tracks if t.get("file_id") not in deleted_ids]
+                project["version"] = int(project.get("version", 0)) + 1
+                project["updated_at"] = now_iso()
+                atomic_write(path, project)
+            self._snapshot_project(project)
+            updated.append({"id": project["id"], "name": project.get("name"),
+                            "removed_tracks": len(removed)})
+        return updated
+
+    def dependents(self, file_id: str) -> Optional[Dict[str, Any]]:
+        """Preview of what deleting ``file_id`` would cascade to.
+
+        Returns ``{"derived": [...], "projects": [...]}`` — the transitive
+        derived files that would be deleted alongside it, and the projects
+        whose tracks reference any of them.  ``None`` if the file is unknown.
+        """
+        lib = self._read_library()
+        files = lib.get("files", {})
+        if file_id not in files:
+            return None
+        ids = self._descendants(files, file_id)
+        idset = set(ids)
+        derived = [files[i] for i in ids if i != file_id]
+        projects = []
+        for p in self.list_projects():
+            n = sum(1 for t in p.get("tracks", []) if t.get("file_id") in idset)
+            if n:
+                projects.append({"id": p["id"], "name": p.get("name"), "tracks": n})
+        return {"derived": derived, "projects": projects}
+
+    def delete_file(self, file_id: str) -> Optional[Dict[str, Any]]:
+        """Delete an audio file, its whole derived subtree and all references to it.
+
+        Cascades through the ``derived_from`` chain (edits, separations, effect
+        renders, exports — including multi-level descendants), removes every
+        artefact from disk, and strips tracks that reference any deleted file
+        from all projects so they never point at missing audio.  Returns a
+        summary ``{"deleted": [...], "projects": [...]}`` or ``None`` when the
+        file does not exist.
+        """
         with locked(self.library_path + ".lock"):
             lib = self._read_library()
-            _delete(lib)
+            files = lib.get("files", {})
+            if file_id not in files:
+                return None
+            deleted = []
+            for fid in self._descendants(files, file_id):
+                entry = files.pop(fid, None)
+                if entry is None:
+                    continue
+                self._remove_file_artefacts(fid, entry)
+                deleted.append(entry)
             atomic_write(self.library_path, lib)
-        return True
+            deleted_ids = {e["id"] for e in deleted}
+        # Project docs live under their own locks — purge after releasing the
+        # library lock to keep a single lock ordering (library -> project).
+        projects = self._purge_from_projects(deleted_ids)
+        return {"deleted": deleted, "projects": projects}
 
     # -- analysis results ------------------------------------------------- #
 
@@ -310,13 +391,35 @@ class Storage:
         self._snapshot_project(project)
         return project
 
-    def delete_project(self, project_id: str) -> bool:
+    def delete_project(self, project_id: str) -> Optional[Dict[str, Any]]:
+        """Delete a project, its version snapshots and its rendered mixdowns.
+
+        Mixdown files carry ``project_id``; leaving them behind would create
+        orphans pointing at a non-existent project, so they are removed along
+        with the project.  Returns a summary or ``None`` when not found.
+        """
         path = self._project_path(project_id)
         if not os.path.isfile(path):
-            return False
+            return None
         with locked(path + ".lock"):
             os.unlink(path)
-        return True
+        for vp in self._version_glob(project_id):
+            if os.path.isfile(vp):
+                os.unlink(vp)
+
+        removed_files = []
+
+        def _delete_mixdowns(lib: Dict[str, Any]) -> None:
+            files = lib.get("files", {})
+            for fid in [f for f, e in files.items() if e.get("project_id") == project_id]:
+                entry = files.pop(fid, None)
+                if entry is None:
+                    continue
+                self._remove_file_artefacts(fid, entry)
+                removed_files.append(entry)
+
+        self._update_library(_delete_mixdowns)
+        return {"id": project_id, "removed_files": removed_files}
 
     # -- version history -------------------------------------------------- #
 
